@@ -1,5 +1,5 @@
 generate:
-	protoc --go_out=. --go-grpc_out=. api/proto/queue.proto
+	protoc --go_out=paths=source_relative:. --go-grpc_out=paths=source_relative:. api/proto/queue.proto
 
 build-example:
 	go build -o examples/distributed/broker/broker ./examples/distributed/broker
