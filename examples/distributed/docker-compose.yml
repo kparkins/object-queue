@@ -1,0 +1,72 @@
+services:
+  minio:
+    image: minio/minio
+    command: server /data --console-address ":9001"
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      MINIO_ROOT_USER: minioadmin
+      MINIO_ROOT_PASSWORD: minioadmin
+    volumes:
+      - minio-data:/data
+
+  # minio-init:
+  #   image: minio/mc
+  #   depends_on:
+  #     - minio
+  #   entrypoint: >
+  #     /bin/sh -c "
+  #     sleep 2;
+  #     mc alias set local http://minio:9000 minioadmin minioadmin;
+  #     mc mb --ignore-existing local/object-queue;
+  #     echo 'Bucket created';
+  #     "
+
+  # broker:
+  #   image: golang:1.23-alpine
+  #   working_dir: /app
+  #   volumes:
+  #     - ../../../:/app
+  #     - go-mod-cache:/go/pkg/mod
+  #   environment:
+  #     - MINIO_ENDPOINT=http://minio:9000
+  #     - MINIO_ACCESS_KEY=minioadmin
+  #     - MINIO_SECRET_KEY=minioadmin
+  #     - MINIO_BUCKET=object-queue
+  #   command: go run ./examples/distributed/broker/main.go
+  #   ports:
+  #     - "50051:50051"
+  #   depends_on:
+  #     minio-init:
+  #       condition: service_completed_successfully
+
+  # pusher:
+  #   image: golang:1.23-alpine
+  #   working_dir: /app
+  #   volumes:
+  #     - ../../../:/app
+  #     - go-mod-cache:/go/pkg/mod
+  #   environment:
+  #     - BROKER_ADDR=broker:50051
+  #   command: go run ./examples/distributed/pusher/main.go
+  #   depends_on:
+  #     - broker
+  #   restart: on-failure
+
+  # worker:
+  #   image: golang:1.23-alpine
+  #   working_dir: /app
+  #   volumes:
+  #     - ../../../:/app
+  #     - go-mod-cache:/go/pkg/mod
+  #   environment:
+  #     - BROKER_ADDR=broker:50051
+  #   command: go run ./examples/distributed/worker/main.go
+  #   depends_on:
+  #     - broker
+  #   restart: on-failure
+
+volumes:
+  go-mod-cache:
+  minio-data:
