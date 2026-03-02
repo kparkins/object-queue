@@ -31,6 +31,7 @@ const (
 // Config holds broker configuration
 type Config struct {
 	Storage             storage.Storage
+	Address             string
 	BatchInterval       time.Duration
 	HeartbeatTimeout    time.Duration
 	BrokerCheckInterval time.Duration
@@ -42,6 +43,7 @@ type Broker struct {
 	config     Config
 	requestCh  chan queue.Request
 	shutdownCh chan struct{}
+	closeOnce  sync.Once
 	wg         sync.WaitGroup
 }
 
@@ -69,9 +71,13 @@ func NewBroker(config Config) *Broker {
 
 // Start starts the broker
 func (b *Broker) Start(ctx context.Context) error {
+	if err := b.register(); err != nil {
+		return fmt.Errorf("failed to register broker: %w", err)
+	}
 
-	b.wg.Add(1)
+	b.wg.Add(2)
 	go b.groupCommitLoop(ctx)
+	go b.brokerCheckLoop(ctx)
 
 	log.Println("Broker started")
 	return nil
@@ -79,9 +85,82 @@ func (b *Broker) Start(ctx context.Context) error {
 
 // Stop stops the broker
 func (b *Broker) Stop() {
-	close(b.shutdownCh)
+	b.closeOnce.Do(func() { close(b.shutdownCh) })
 	b.wg.Wait()
 	log.Println("Broker stopped")
+}
+
+// Done returns a channel that is closed when the broker shuts down
+func (b *Broker) Done() <-chan struct{} {
+	return b.shutdownCh
+}
+
+// DiscoverBroker reads storage and returns the current broker address
+func DiscoverBroker(s storage.Storage) (string, error) {
+	state, err := s.Read()
+	if err != nil {
+		return "", fmt.Errorf("failed to read state: %w", err)
+	}
+	if state.Broker == "" {
+		return "", errors.New("no broker registered")
+	}
+	return state.Broker, nil
+}
+
+var errBrokerReplaced = errors.New("broker has been replaced")
+
+func (b *Broker) register() error {
+	bo := backoff.NewExponentialBackOff()
+	bo.MaxElapsedTime = 5 * time.Second
+
+	return backoff.Retry(func() error {
+		state, err := b.config.Storage.Read()
+		if err != nil {
+			return fmt.Errorf("failed to read state: %w", err)
+		}
+		newState := *state
+		newState.Jobs = make([]queue.Job, len(state.Jobs))
+		copy(newState.Jobs, state.Jobs)
+		newState.Broker = b.config.Address
+
+		err = b.config.Storage.CompareAndSwap(state.Version, &newState)
+		if err == storage.ErrCASFailure {
+			return err
+		}
+		if err != nil {
+			return backoff.Permanent(err)
+		}
+
+		log.Printf("Registered as active broker at %s", b.config.Address)
+		return nil
+	}, bo)
+}
+
+func (b *Broker) brokerCheckLoop(ctx context.Context) {
+	defer b.wg.Done()
+
+	ticker := time.NewTicker(b.config.BrokerCheckInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-b.shutdownCh:
+			return
+		case <-ticker.C:
+			state, err := b.config.Storage.Read()
+			if err != nil {
+				log.Printf("Broker check failed: %v", err)
+				continue
+			}
+			if state.Broker != b.config.Address {
+				log.Printf("Broker replaced by %s, shutting down", state.Broker)
+				b.closeOnce.Do(func() { close(b.shutdownCh) })
+				return
+			}
+		}
+	}
 }
 
 // HandleRequest handles a request from a client
@@ -117,14 +196,15 @@ func (b *Broker) groupCommitLoop(ctx context.Context) {
 	batch := make([]queue.Request, 0, b.config.BufferSize)
 
 	flush := func() {
+		defer timer.Reset(b.config.BatchInterval)
 		batch = drainRequests(b.requestCh, batch)
-		if len(batch) > 0 {
-			if err := b.processRequests(batch); err != nil {
-				log.Printf("Error processing requests: %v", err)
-			}
-			batch = batch[:0]
+		if len(batch) <= 0 {
+			return
 		}
-		timer.Reset(b.config.BatchInterval)
+		if err := b.processRequests(batch); err != nil {
+			log.Printf("Error processing requests: %v", err)
+		}
+		batch = batch[:0]
 	}
 
 	for {
@@ -158,6 +238,12 @@ func (b *Broker) processRequests(requests []queue.Request) error {
 			return fmt.Errorf("failed to read state: %w", err)
 		}
 
+		if state.Broker != b.config.Address {
+			log.Printf("Broker replaced by %s, shutting down", state.Broker)
+			b.closeOnce.Do(func() { close(b.shutdownCh) })
+			return backoff.Permanent(errBrokerReplaced)
+		}
+
 		newState := *state
 		newState.Jobs = make([]queue.Job, len(state.Jobs))
 		copy(newState.Jobs, state.Jobs)
@@ -171,11 +257,9 @@ func (b *Broker) processRequests(requests []queue.Request) error {
 			responses[idx] = b.handleSingleRequest(&newState, req)
 		}
 
-		// Try to commit
 		err = b.config.Storage.CompareAndSwap(state.Version, &newState)
 		if err != nil {
 			if err == storage.ErrCASFailure {
-				// CAS failure is retryable
 				return err
 			}
 			// Other errors are not retryable
@@ -280,22 +364,17 @@ func (b *Broker) handleHeartbeat(state *queue.QueueState, req queue.Request) que
 	}
 }
 
-// handleComplete handles a complete request
+// handleComplete handles a complete request. Idempotent — if the job is
+// already gone, we treat it as a successful completion (duplicate request).
 func (b *Broker) handleComplete(state *queue.QueueState, req queue.Request) queue.Response {
 	for i := range state.Jobs {
 		if state.Jobs[i].ID == req.JobID && state.Jobs[i].WorkerID == req.WorkerID {
-			// Remove completed job from the queue
 			log.Printf("Removing completed job %s from queue", req.JobID)
 			state.Jobs = append(state.Jobs[:i], state.Jobs[i+1:]...)
 			return queue.Response{Success: true}
 		}
 	}
-
-	log.Printf("Complete request failed: job %s not found or worker mismatch", req.JobID)
-	return queue.Response{
-		Success: false,
-		Error:   errors.New("job not found or worker mismatch"),
-	}
+	return queue.Response{Success: true}
 }
 
 // cleanupTimedOutJobs resets jobs that have timed out

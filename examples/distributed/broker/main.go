@@ -34,9 +34,13 @@ func main() {
 	}
 	defer store.Close()
 
+	listenAddr := getEnv("LISTEN_ADDR", ":50051")
+	advertiseAddr := getEnv("ADVERTISE_ADDR", listenAddr)
+
 	// Create broker
 	brk := broker.NewBroker(broker.Config{
 		Storage: store,
+		Address: advertiseAddr,
 	})
 
 	if err := brk.Start(ctx); err != nil {
@@ -49,17 +53,21 @@ func main() {
 
 	// Start gRPC server in background
 	go func() {
-		if err := server.Serve(":50051"); err != nil {
+		if err := server.Serve(listenAddr); err != nil {
 			log.Fatalf("gRPC server failed: %v", err)
 		}
 	}()
 
-	log.Println("Broker running on :50051")
+	log.Printf("Broker running on %s (advertising as %s)", listenAddr, advertiseAddr)
 	log.Println("Press Ctrl+C to stop")
 
-	// Wait for shutdown signal
-	<-sigCh
-	log.Println("Shutting down...")
+	// Wait for shutdown signal or broker replacement
+	select {
+	case <-sigCh:
+		log.Println("Shutting down...")
+	case <-brk.Done():
+		log.Println("Broker replaced, shutting down...")
+	}
 
 	server.Stop()
 	cancel()

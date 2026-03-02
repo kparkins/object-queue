@@ -48,18 +48,14 @@ func (s *QueueServer) Push(ctx context.Context, req *pb.PushRequest) (*pb.PushRe
 
 	s.broker.HandleRequest(queueReq)
 
-	// Wait for response
-	select {
-	case resp := <-responseCh:
-		if !resp.Success {
-			return nil, fmt.Errorf("push failed: %v", resp.Error)
-		}
-		return &pb.PushResponse{
-			Job: jobToProto(resp.Job),
-		}, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	resp, err := awaitResponse(ctx, responseCh)
+	if err != nil {
+		return nil, err
 	}
+	if !resp.Success {
+		return nil, fmt.Errorf("push failed: %v", resp.Error)
+	}
+	return &pb.PushResponse{Job: jobToProto(resp.Job)}, nil
 }
 
 // Claim implements QueueService.Claim
@@ -74,17 +70,14 @@ func (s *QueueServer) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.Clai
 
 	s.broker.HandleRequest(queueReq)
 
-	select {
-	case resp := <-responseCh:
-		if !resp.Success {
-			return nil, fmt.Errorf("claim failed: %v", resp.Error)
-		}
-		return &pb.ClaimResponse{
-			Job: jobToProto(resp.Job),
-		}, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	resp, err := awaitResponse(ctx, responseCh)
+	if err != nil {
+		return nil, err
 	}
+	if !resp.Success {
+		return nil, fmt.Errorf("claim failed: %v", resp.Error)
+	}
+	return &pb.ClaimResponse{Job: jobToProto(resp.Job)}, nil
 }
 
 // Heartbeat implements QueueService.Heartbeat
@@ -100,14 +93,11 @@ func (s *QueueServer) Heartbeat(ctx context.Context, req *pb.HeartbeatRequest) (
 
 	s.broker.HandleRequest(queueReq)
 
-	select {
-	case resp := <-responseCh:
-		return &pb.HeartbeatResponse{
-			Success: resp.Success,
-		}, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	resp, err := awaitResponse(ctx, responseCh)
+	if err != nil {
+		return nil, err
 	}
+	return &pb.HeartbeatResponse{Success: resp.Success}, nil
 }
 
 // Complete implements QueueService.Complete
@@ -123,14 +113,11 @@ func (s *QueueServer) Complete(ctx context.Context, req *pb.CompleteRequest) (*p
 
 	s.broker.HandleRequest(queueReq)
 
-	select {
-	case resp := <-responseCh:
-		return &pb.CompleteResponse{
-			Success: resp.Success,
-		}, nil
-	case <-ctx.Done():
-		return nil, ctx.Err()
+	resp, err := awaitResponse(ctx, responseCh)
+	if err != nil {
+		return nil, err
 	}
+	return &pb.CompleteResponse{Success: resp.Success}, nil
 }
 
 // Serve starts the gRPC server on the given address
@@ -151,6 +138,15 @@ func (s *QueueServer) Serve(address string) error {
 func (s *QueueServer) Stop() {
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
+	}
+}
+
+func awaitResponse(ctx context.Context, ch <-chan queue.Response) (queue.Response, error) {
+	select {
+	case resp := <-ch:
+		return resp, nil
+	case <-ctx.Done():
+		return queue.Response{}, ctx.Err()
 	}
 }
 
