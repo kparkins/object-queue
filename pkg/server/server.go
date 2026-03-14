@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
@@ -11,6 +12,8 @@ import (
 	"object-queue/pkg/queue"
 
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
+	"google.golang.org/grpc/status"
 	"google.golang.org/protobuf/types/known/timestamppb"
 )
 
@@ -53,7 +56,7 @@ func (s *QueueServer) Push(ctx context.Context, req *pb.PushRequest) (*pb.PushRe
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("push failed: %v", resp.Error)
+		return nil, toGRPCError(resp.Error)
 	}
 	return &pb.PushResponse{Job: jobToProto(resp.Job)}, nil
 }
@@ -75,7 +78,7 @@ func (s *QueueServer) Claim(ctx context.Context, req *pb.ClaimRequest) (*pb.Clai
 		return nil, err
 	}
 	if !resp.Success {
-		return nil, fmt.Errorf("claim failed: %v", resp.Error)
+		return nil, toGRPCError(resp.Error)
 	}
 	return &pb.ClaimResponse{Job: jobToProto(resp.Job)}, nil
 }
@@ -138,6 +141,18 @@ func (s *QueueServer) Serve(address string) error {
 func (s *QueueServer) Stop() {
 	if s.grpcServer != nil {
 		s.grpcServer.GracefulStop()
+	}
+}
+
+// toGRPCError maps broker response errors to appropriate gRPC status codes.
+func toGRPCError(err error) error {
+	switch {
+	case errors.Is(err, queue.ErrNoJobsAvailable):
+		return status.Error(codes.NotFound, err.Error())
+	case errors.Is(err, queue.ErrJobNotFound):
+		return status.Error(codes.NotFound, err.Error())
+	default:
+		return status.Error(codes.Internal, err.Error())
 	}
 }
 

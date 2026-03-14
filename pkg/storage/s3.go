@@ -13,11 +13,20 @@ import (
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/aws/aws-sdk-go-v2/service/s3/types"
+	"github.com/aws/smithy-go"
 )
+
+// S3API defines the subset of S3 client methods used by S3Storage.
+// This enables testing with mock implementations.
+type S3API interface {
+	GetObject(ctx context.Context, params *s3.GetObjectInput, optFns ...func(*s3.Options)) (*s3.GetObjectOutput, error)
+	PutObject(ctx context.Context, params *s3.PutObjectInput, optFns ...func(*s3.Options)) (*s3.PutObjectOutput, error)
+	HeadObject(ctx context.Context, params *s3.HeadObjectInput, optFns ...func(*s3.Options)) (*s3.HeadObjectOutput, error)
+}
 
 // S3Storage implements Storage using AWS S3 or S3-compatible storage (MinIO, etc.)
 type S3Storage struct {
-	client *s3.Client
+	client S3API
 	bucket string
 	key    string
 	ctx    context.Context
@@ -55,9 +64,9 @@ func NewS3Storage(config S3Config) (*S3Storage, error) {
 	return NewS3StorageWithClient(client, config.Bucket, config.Key, config.Context)
 }
 
-// NewS3StorageWithClient creates a new S3-based storage with a pre-configured client
-// This is useful for custom endpoint configurations (e.g., MinIO)
-func NewS3StorageWithClient(client *s3.Client, bucket, key string, ctx context.Context) (*S3Storage, error) {
+// NewS3StorageWithClient creates a new S3-based storage with a pre-configured client.
+// This is useful for custom endpoint configurations (e.g., MinIO).
+func NewS3StorageWithClient(client S3API, bucket, key string, ctx context.Context) (*S3Storage, error) {
 	if bucket == "" {
 		return nil, fmt.Errorf("bucket name is required")
 	}
@@ -155,11 +164,12 @@ func (s *S3Storage) Read() (*queue.QueueState, error) {
 	return &state, nil
 }
 
-// CompareAndSwap atomically updates the queue state using S3's conditional writes
-// S3 doesn't have built-in CAS, so we use ETag-based conditional updates
+// CompareAndSwap atomically updates the queue state using S3's conditional writes.
+// It uses a single GetObject to read both the data and ETag atomically, then
+// PutObject with IfMatch to ensure no concurrent modification occurred.
 func (s *S3Storage) CompareAndSwap(expectedVersion int64, newState *queue.QueueState) error {
-	// First, read to get the current ETag and verify version
-	headResult, err := s.client.HeadObject(s.ctx, &s3.HeadObjectInput{
+	// Single GetObject to get both data and ETag atomically
+	result, err := s.client.GetObject(s.ctx, &s3.GetObjectInput{
 		Bucket: aws.String(s.bucket),
 		Key:    aws.String(s.key),
 	})
@@ -169,13 +179,18 @@ func (s *S3Storage) CompareAndSwap(expectedVersion int64, newState *queue.QueueS
 		if errors.As(err, &notFound) || errors.As(err, &noSuchKey) {
 			return ErrNotFound
 		}
-		return fmt.Errorf("failed to head object: %w", err)
+		return fmt.Errorf("failed to get object: %w", err)
 	}
 
-	// Read the current state to verify version
-	currentState, err := s.Read()
+	body, err := io.ReadAll(result.Body)
+	result.Body.Close()
 	if err != nil {
-		return err
+		return fmt.Errorf("failed to read object body: %w", err)
+	}
+
+	var currentState queue.QueueState
+	if err := json.Unmarshal(body, &currentState); err != nil {
+		return fmt.Errorf("failed to unmarshal state: %w", err)
 	}
 
 	// Check version match
@@ -192,19 +207,16 @@ func (s *S3Storage) CompareAndSwap(expectedVersion int64, newState *queue.QueueS
 		return fmt.Errorf("failed to marshal new state: %w", err)
 	}
 
-	// Use If-Match to ensure the object hasn't changed
-	// This provides the CAS semantics we need
+	// Use IfMatch with the ETag from the same GetObject response
 	_, err = s.client.PutObject(s.ctx, &s3.PutObjectInput{
 		Bucket:  aws.String(s.bucket),
 		Key:     aws.String(s.key),
 		Body:    bytes.NewReader(data),
-		IfMatch: headResult.ETag,
+		IfMatch: result.ETag,
 	})
 	if err != nil {
-		// Check if it's a precondition failure (ETag mismatch)
-		// AWS SDK v2 returns this as a regular error with specific error code
-		if err.Error() != "" && (bytes.Contains([]byte(err.Error()), []byte("PreconditionFailed")) ||
-			bytes.Contains([]byte(err.Error()), []byte("412"))) {
+		var apiErr smithy.APIError
+		if errors.As(err, &apiErr) && apiErr.ErrorCode() == "PreconditionFailed" {
 			return ErrCASFailure
 		}
 		return fmt.Errorf("failed to put object: %w", err)

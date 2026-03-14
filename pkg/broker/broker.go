@@ -345,7 +345,7 @@ func (b *Broker) handleClaim(state *queue.QueueState, req queue.Request) queue.R
 
 	return queue.Response{
 		Success: false,
-		Error:   errors.New("no jobs available"),
+		Error:   queue.ErrNoJobsAvailable,
 	}
 }
 
@@ -353,14 +353,15 @@ func (b *Broker) handleClaim(state *queue.QueueState, req queue.Request) queue.R
 func (b *Broker) handleHeartbeat(state *queue.QueueState, req queue.Request) queue.Response {
 	for i := range state.Jobs {
 		if state.Jobs[i].ID == req.JobID && state.Jobs[i].WorkerID == req.WorkerID {
-			state.Jobs[i].LastHeartbeat = &req.Timestamp
+			now := time.Now()
+			state.Jobs[i].LastHeartbeat = &now
 			return queue.Response{Success: true}
 		}
 	}
 
 	return queue.Response{
 		Success: false,
-		Error:   errors.New("job not found or worker mismatch"),
+		Error:   queue.ErrJobNotFound,
 	}
 }
 
