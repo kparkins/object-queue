@@ -1,6 +1,16 @@
 package queue
 
-import "time"
+import (
+	"errors"
+	"time"
+)
+
+var (
+	// ErrNoJobsAvailable indicates no pending jobs are available to claim
+	ErrNoJobsAvailable = errors.New("no jobs available")
+	// ErrJobNotFound indicates the job was not found or worker mismatch
+	ErrJobNotFound = errors.New("job not found or worker mismatch")
+)
 
 // JobStatus represents the status of a job in the queue
 type JobStatus string
@@ -34,12 +44,11 @@ type QueueState struct {
 
 // Request represents a request from a client to the broker
 type Request struct {
-	Type      RequestType            `json:"type"`
-	JobData   map[string]interface{} `json:"job_data,omitempty"`
-	JobID     string                 `json:"job_id,omitempty"`
-	WorkerID  string                 `json:"worker_id,omitempty"`
-	Timestamp time.Time              `json:"timestamp"`
-	ResponseCh chan<- Response       `json:"-"`
+	Type       RequestType            `json:"type"`
+	JobData    map[string]interface{} `json:"job_data,omitempty"`
+	JobID      string                 `json:"job_id,omitempty"`
+	WorkerID   string                 `json:"worker_id,omitempty"`
+	ResponseCh chan<- Response        `json:"-"`
 }
 
 // RequestType specifies the type of request

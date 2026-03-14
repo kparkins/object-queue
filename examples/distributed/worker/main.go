@@ -2,26 +2,22 @@ package main
 
 import (
 	"context"
-	"fmt"
 	"log"
 	"os"
 	"os/signal"
-	"strings"
 	"sync"
 	"syscall"
 	"time"
 
 	pb "object-queue/api/proto"
+	"object-queue/examples/distributed/shared"
 	"object-queue/pkg/broker"
-	"object-queue/pkg/storage"
 
-	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
-	"github.com/aws/aws-sdk-go-v2/credentials"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 	"github.com/google/uuid"
 	"google.golang.org/grpc"
+	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials/insecure"
+	"google.golang.org/grpc/status"
 )
 
 func main() {
@@ -30,7 +26,7 @@ func main() {
 
 	brokerAddr := os.Getenv("BROKER_ADDR")
 	if brokerAddr == "" {
-		store, err := createStorage(ctx)
+		store, err := shared.CreateStorage(ctx)
 		if err != nil {
 			log.Fatalf("Failed to create storage for discovery: %v", err)
 		}
@@ -111,7 +107,7 @@ loop:
 				resp, err := client.Claim(ctx, &pb.ClaimRequest{WorkerId: workerID})
 				if err != nil {
 					<-semaphore
-					if !strings.Contains(err.Error(), "no jobs available") {
+					if status.Code(err) != codes.NotFound {
 						log.Printf("Failed to claim job: %v", err)
 					}
 					continue
@@ -155,47 +151,4 @@ loop:
 	cancel()
 	wg.Wait()
 	log.Println("Worker stopped.")
-}
-
-func getEnv(key string, defaultValue string) string {
-	value := os.Getenv(key)
-	if value == "" {
-		return defaultValue
-	}
-	return value
-}
-
-func createStorage(ctx context.Context) (storage.Storage, error) {
-	endpoint := getEnv("MINIO_ENDPOINT", "http://localhost:9000")
-	accessKey := getEnv("MINIO_ACCESS_KEY", "minioadmin")
-	secretKey := getEnv("MINIO_SECRET_KEY", "minioadmin")
-	bucket := getEnv("MINIO_BUCKET", "object-queue")
-	key := getEnv("MINIO_KEY", "queue.json")
-
-	awsCfg, err := config.LoadDefaultConfig(ctx,
-		config.WithRegion("us-east-1"),
-		config.WithCredentialsProvider(credentials.NewStaticCredentialsProvider(
-			accessKey, secretKey, "",
-		)),
-	)
-	if err != nil {
-		return nil, err
-	}
-
-	s3Client := s3.NewFromConfig(awsCfg, func(o *s3.Options) {
-		o.BaseEndpoint = aws.String(endpoint)
-		o.UsePathStyle = true
-	})
-
-	_, err = s3Client.CreateBucket(ctx, &s3.CreateBucketInput{
-		Bucket: aws.String(bucket),
-	})
-	if err != nil {
-		if !strings.Contains(err.Error(), "BucketAlreadyOwnedByYou") &&
-			!strings.Contains(err.Error(), "BucketAlreadyExists") {
-			return nil, fmt.Errorf("failed to create bucket: %w", err)
-		}
-	}
-
-	return storage.NewS3StorageWithClient(s3Client, bucket, key, ctx)
 }
